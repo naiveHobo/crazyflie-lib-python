@@ -6,12 +6,20 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  schedule:
+    # Weekly build to make sure dependencies are OK
+    - cron:  '30 16 * * 6'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-    - name: Check and build
-      run: docker run --rm -v ${PWD}:/module bitcraze/builder ./tools/build/build 
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Build
+      run: docker run --rm -v ${PWD}:/module bitcraze/builder ./tools/build/build
+
+    - name: Build docs
+      run: docker run --rm -v ${PWD}:/module bitcraze/web-builder ./tools/build-docs/build-docs

@@ -45,13 +45,14 @@ uri = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
 # Change the sequence according to your setup
 #             x    y    z  YAW
 sequence = [
-    (2.5, 2.5, 1.2, 0),
-    (1.5, 2.5, 1.2, 0),
-    (2.5, 2.0, 1.2, 0),
-    (3.5, 2.5, 1.2, 0),
-    (2.5, 3.0, 1.2, 0),
-    (2.5, 2.5, 1.2, 0),
-    (2.5, 2.5, 0.4, 0),
+    (0.0, 0.0, 0.4, 0),
+    (0.0, 0.0, 1.2, 0),
+    (0.5, -0.5, 1.2, 0),
+    (0.5, 0.5, 1.2, 0),
+    (-0.5, 0.5, 1.2, 0),
+    (-0.5, -0.5, 1.2, 0),
+    (0.0, 0.0, 1.2, 0),
+    (0.0, 0.0, 0.4, 0),
 ]
 
 
@@ -136,6 +137,9 @@ def run_sequence(scf, sequence):
             time.sleep(0.1)
 
     cf.commander.send_stop_setpoint()
+    # Hand control over to the high level commander to avoid timeout and locking of the Crazyflie
+    cf.commander.send_notify_setpoint_stop()
+
     # Make sure that the last packet leaves before the link is closed
     # since the message queue is not flushed before closing
     time.sleep(0.1)

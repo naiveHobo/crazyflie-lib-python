@@ -1,6 +1,7 @@
 ---
 title: Debugging CRTP using Wireshark
 page_id: wireshark_debugging
+redirect:  /wireshark/wireshark/
 ---
 
 Wireshark is a free and open-source packet analyzer. It is used for network troubleshooting, analysis, software and communications protocol development, and education. It makes analyzing what is going on with packet based protocols easier.
@@ -35,6 +36,13 @@ To tell the CFLIB to generate a PCAP file of what it thinks the CRTP traffic loo
 ```bash
 $ CRTP_PCAP_LOG=filename.pcap python3 examples/swarm/hl-commander-swarm.py
 $ wireshark filename.pcap
+```
+and on Windows based computers in a shell window:
+
+```bash
+> set CRTP_PCAP_LOG=filename.pcap
+> python3 examples/swarm/hl-commander-swarm.py
+> wireshark filename.pcap
 ```
 To generate a PCAP file and open it with Wireshark. You can also use the text based `tshark` tool, and you can add a filter, for instance, only shoow CRTP port 8 (Highlevel setpoint):
 

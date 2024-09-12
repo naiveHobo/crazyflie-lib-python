@@ -33,6 +33,7 @@ import errno
 import logging
 import struct
 from collections import namedtuple
+from queue import Empty
 from queue import Queue
 from threading import Event
 from threading import Lock
@@ -61,14 +62,15 @@ WRITE_CHANNEL = 2
 MISC_CHANNEL = 3
 
 MISC_SETBYNAME = 0
+MISC_VALUE_UPDATED = 1
 MISC_GET_EXTENDED_TYPE = 2
-
-PersistentParamState = namedtuple('PersistentParamState', 'is_stored default_value stored_value')
-
 MISC_PERSISTENT_STORE = 3
 MISC_PERSISTENT_GET_STATE = 4
 MISC_PERSISTENT_CLEAR = 5
 MISC_GET_DEFAULT_VALUE = 6
+
+PersistentParamState = namedtuple('PersistentParamState', 'is_stored default_value stored_value')
+
 
 # One element entry in the TOC
 
@@ -108,7 +110,7 @@ class ParamTocElement:
             self.name = strs[1]
 
             metadata = data[0]
-            if type(metadata) == str:
+            if isinstance(metadata, str):
                 metadata = ord(metadata)
 
             # If the fouth byte (1 << 4) (0x10) is set we have extended
@@ -152,11 +154,11 @@ class Param():
         self.all_update_callback = Caller()
         self.param_updater = None
 
-        self.param_updater = _ParamUpdater(
-            self.cf, self._useV2, self._param_updated)
+        self.param_updater = _ParamUpdater(self.cf, self._useV2, self._param_updated)
         self.param_updater.start()
 
         self.cf.disconnected.add_callback(self._disconnected)
+        self.cf.connection_requested.add_callback(self._connection_requested)
 
         self.all_updated = Caller()
         self.is_updated = False
@@ -185,23 +187,39 @@ class Param():
 
     def _param_updated(self, pk):
         """Callback with data for an updated parameter"""
+
+        # This method handles both param value packets as well as misc param updated packets
+        # The Misc packets have a command byte first and the variable id is shifted one byte
+        # Misc packets are not supported for V1
+        if pk.channel == MISC_CHANNEL:
+            id_index = 1
+        else:
+            id_index = 0
+
         if self._useV2:
-            var_id = struct.unpack('<H', pk.data[:2])[0]
+            var_id = struct.unpack('<H', pk.data[id_index:id_index + 2])[0]
         else:
             var_id = pk.data[0]
         element = self.toc.get_element_by_id(var_id)
         if element:
             if self._useV2:
-                s = struct.unpack(element.pytype, pk.data[2:])[0]
+                value = struct.unpack(element.pytype, pk.data[id_index + 2:])[0]
             else:
-                s = struct.unpack(element.pytype, pk.data[1:])[0]
-            s = s.__str__()
+                value = struct.unpack(element.pytype, pk.data[1:])[0]
+            value_s = value.__str__()
             complete_name = '%s.%s' % (element.group, element.name)
 
             # Save the value for synchronous access
             if element.group not in self.values:
                 self.values[element.group] = {}
-            self.values[element.group][element.name] = s
+            self.values[element.group][element.name] = value_s
+
+            logger.debug('Updated parameter [%s]' % complete_name)
+            if complete_name in self.param_update_callbacks:
+                self.param_update_callbacks[complete_name].call(complete_name, value_s)
+            if element.group in self.group_update_callbacks:
+                self.group_update_callbacks[element.group].call(complete_name, value_s)
+            self.all_update_callback.call(complete_name, value_s)
 
             # Once all the parameters are updated call the
             # callback for "everything updated"
@@ -209,15 +227,6 @@ class Param():
                 self.is_updated = True
                 self._initialized.set()
                 self.all_updated.call()
-
-            logger.debug('Updated parameter [%s]' % complete_name)
-            if complete_name in self.param_update_callbacks:
-                self.param_update_callbacks[complete_name].call(
-                    complete_name, s)
-            if element.group in self.group_update_callbacks:
-                self.group_update_callbacks[element.group].call(
-                    complete_name, s)
-            self.all_update_callback.call(complete_name, s)
         else:
             logger.debug('Variable id [%d] not found in TOC', var_id)
 
@@ -277,11 +286,19 @@ class Param():
                                  refresh_done, toc_cache)
         toc_fetcher.start()
 
+    def _connection_requested(self, uri):
+        # Reset the internal state on connect to make sure we have a clean state
+        self.is_updated = False
+        self.toc = Toc()
+        self.values = {}
+        self._initialized.clear()
+
     def _disconnected(self, uri):
         """Disconnected callback from Crazyflie API"""
         self.param_updater.close()
-        self.is_updated = False
-        self._initialized.clear()
+
+        # Do not clear self.is_updated here as we might get spurious parameter updates later
+
         # Clear all values from the previous Crazyflie
         self.toc = Toc()
         self.values = {}
@@ -316,8 +333,11 @@ class Param():
         """
         Set the value for the supplied parameter.
         """
-        if not self._initialized.wait(timeout=60):
-            raise Exception('Connection timed out')
+        if not self._initialized.isSet():
+            if self.cf.is_called_by_incoming_handler_thread():
+                raise Exception('Can not set parameter from callback until fully connected.')
+            if not self._initialized.wait(timeout=60):
+                raise Exception('Connection timed out')
 
         element = self.toc.get_element_by_complete_name(complete_name)
 
@@ -338,10 +358,10 @@ class Param():
             else:
                 pk.data = struct.pack('<B', varid)
 
-            try:
-                value_nr = int(value)
-            except ValueError:
+            if element.pytype == '<f' or element.pytype == '<d':
                 value_nr = float(value)
+            else:
+                value_nr = int(value)
 
             pk.data += struct.pack(element.pytype, value_nr)
             self.param_updater.request_param_setvalue(pk)
@@ -351,8 +371,11 @@ class Param():
         Read a value for the supplied parameter. This can block for a period
         of time if the parameter values have not been fetched yet.
         """
-        if not self._initialized.wait(timeout=60):
-            raise Exception('Connection timed out')
+        if not self._initialized.isSet():
+            if self.cf.is_called_by_incoming_handler_thread():
+                raise Exception('Can not get parameter from callback until fully connected.')
+            if not self._initialized.wait(timeout=60):
+                raise Exception('Connection timed out')
 
         [group, name] = complete_name.split('.')
         return self.values[group][name]
@@ -422,6 +445,9 @@ class Param():
         @param callback Optional callback should take `complete_name` and boolean status as arguments
         """
         element = self.toc.get_element_by_complete_name(complete_name)
+        if not element:
+            callback(complete_name, False)
+            return
         if not element.is_persistent():
             raise AttributeError(f"Param '{complete_name}' is not persistent")
 
@@ -537,19 +563,22 @@ class _ExtendedTypeFetcher(Thread):
             pk = CRTPPacket()
             pk.set_header(CRTPPort.PARAM, MISC_CHANNEL)
 
-            pk.data = struct.pack('<BH',
-                                  MISC_GET_EXTENDED_TYPE, element.ident)
+            pk.data = struct.pack('<BH', MISC_GET_EXTENDED_TYPE, element.ident)
             self.request_queue.put(pk)
 
     def _close(self):
         # First empty the queue from all packets
-        while not self.request_queue.empty():
-            self.request_queue.get()
+        try:
+            while True:
+                self.request_queue.get(block=False)
+        except Empty:
+            pass
+
         # Then force an unlock of the mutex if we are waiting for a packet
         # we didn't get back due to a disconnect for example.
         try:
             self._lock.release()
-        except Exception:
+        except RuntimeError:
             pass
 
     def run(self):
@@ -578,17 +607,21 @@ class _ParamUpdater(Thread):
         self.request_queue = Queue()
         self.cf.add_port_callback(CRTPPort.PARAM, self._new_packet_cb)
         self._should_close = False
-        self._req_param = -1
+        self._lock_pattern = None
 
     def close(self):
         # First empty the queue from all packets
-        while not self.request_queue.empty():
-            self.request_queue.get()
+        try:
+            while True:
+                self.request_queue.get(block=False)
+        except Empty:
+            pass
+
         # Then force an unlock of the mutex if we are waiting for a packet
         # we didn't get back due to a disconnect for example.
         try:
             self.wait_lock.release()
-        except Exception:
+        except RuntimeError:
             pass
 
     def request_param_setvalue(self, pk):
@@ -605,22 +638,28 @@ class _ParamUpdater(Thread):
         """Callback for newly arrived packets"""
         if pk.channel == READ_CHANNEL or pk.channel == WRITE_CHANNEL:
             if self._useV2:
-                var_id = struct.unpack('<H', pk.data[:2])[0]
+                release_pattern = pk.data[:2]
                 if pk.channel == READ_CHANNEL:
                     pk.data = pk.data[:2] + pk.data[3:]
             else:
-                var_id = pk.data[0]
-            if (pk.channel != TOC_CHANNEL and self._req_param == var_id and
+                release_pattern = pk.data[:1]
+
+            if (pk.channel != TOC_CHANNEL and self._lock_pattern == release_pattern and
                     pk is not None):
                 self.updated_callback(pk)
-                self._req_param = -1
+                self._lock_pattern = None
                 try:
                     self.wait_lock.release()
                 except Exception:
                     pass
         elif pk.channel == MISC_CHANNEL:
-            command = struct.unpack('<H', pk.data[:2])[0]
-            if self._req_param == command:
+            command = pk.data[0]
+            if command == MISC_VALUE_UPDATED:
+                self.updated_callback(pk)
+
+            release_pattern = pk.data[:3]
+            if self._lock_pattern == release_pattern:
+                self._lock_pattern = None
                 self.wait_lock.release()
 
     def request_param_update(self, var_id):
@@ -641,12 +680,14 @@ class _ParamUpdater(Thread):
             self.wait_lock.acquire()
             if self.cf.link:
                 if self._useV2:
-                    self._req_param = struct.unpack('<H', pk.data[:2])[0]
-                    self.cf.send_packet(
-                        pk, expected_reply=(tuple(pk.data[:2])))
+                    if pk.channel == MISC_CHANNEL:
+                        self._lock_pattern = pk.data[:3]
+                    else:
+                        self._lock_pattern = pk.data[:2]
+
+                    self.cf.send_packet(pk, expected_reply=(tuple(self._lock_pattern)))
                 else:
-                    self._req_param = pk.data[0]
-                    self.cf.send_packet(
-                        pk, expected_reply=(tuple(pk.data[:1])))
+                    self._lock_pattern = pk.data[:1]
+                    self.cf.send_packet(pk, expected_reply=(tuple(pk.data[:1])))
             else:
                 self.wait_lock.release()

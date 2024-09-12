@@ -24,6 +24,7 @@ import math
 import struct
 
 from .memory_element import MemoryElement
+from cflib.utils.callbacks import Syncer
 
 logger = logging.getLogger(__name__)
 
@@ -158,29 +159,39 @@ class TrajectoryMemory(MemoryElement):
 
     def __init__(self, id, type, size, mem_handler):
         """Initialize trajectory memory"""
-        super(TrajectoryMemory, self).__init__(id=id, type=type, size=size,
-                                               mem_handler=mem_handler)
+        super(TrajectoryMemory, self).__init__(id=id, type=type, size=size, mem_handler=mem_handler)
         self._write_finished_cb = None
         self._write_failed_cb = None
 
         # A list of trajectory elements to write to the Crazyflie. The elements can either be
-        # Poly4D instances for uncomressed trajectorys or one CompressedStart instance followed
+        # Poly4D instances for uncompressed trajectories or one CompressedStart instance followed
         # by CompressedSegment instances. It is not possible to mix uncompressed and compressed
         # elements in the same trajectory.
         self.trajectory = []
 
-    # Deprecated. replaced by self.trajectory
+    # Deprecated (removed after August 2023). replaced by self.trajectory
     @property
     def poly4Ds(self):
         return self.trajectory
 
-    # Deprecated. replaced by self.trajectory
+    # Deprecated (removed after August 2023). replaced by self.trajectory
     @poly4Ds.setter
     def poly4Ds(self, trajectory):
         self.trajectory = trajectory
 
-    def write_data(self, write_finished_cb, write_failed_cb=None):
-        """Write trajectory data to the Crazyflie"""
+    def write_data(self, write_finished_cb, write_failed_cb=None, start_addr=0x00):
+        """
+        Write trajectory data to the Crazyflie.
+        The trajectory in self.trajectory is written to the Crazyflie.
+        By default the trajectory is written to address 0 of the Crazyflie trajectory memory, but it is possible to
+        use a different address. This can be interesting if you want to define more than one trajectory but it requires
+        careful handling of the addresses to avoid overwriting trajectories and staying within the trajectory memory.
+
+        @param write_finished_cb A callback that is called when the write trajectory is uploaded.
+        @param write_failed_cb Callback that is called if the upload failed
+        @param start_addr The address in the trajectory memory to upload the trajectory to (0 by default)
+        @return The number of bytes used for the trajectory
+        """
         self._write_finished_cb = write_finished_cb
         self._write_failed_cb = write_failed_cb
         data = bytearray()
@@ -188,7 +199,21 @@ class TrajectoryMemory(MemoryElement):
         for element in self.trajectory:
             data += element.pack()
 
-        self.mem_handler.write(self, 0x00, data, flush_queue=True)
+        self.mem_handler.write(self, start_addr, data, flush_queue=True)
+        return len(data)
+
+    def write_data_sync(self, start_addr=0x00):
+        """
+        Same functionality as write_data() but synchronous (blocking)
+
+        Args:
+            start_addr (hexadecimal, optional): The address in the trajectory memory to upload the trajectory to.
+            Defaults to 0x00.
+        """
+        syncer = Syncer()
+        self.write_data(syncer.success_cb, write_failed_cb=syncer.failure_cb, start_addr=start_addr)
+        syncer.wait()
+        return syncer.is_success
 
     def write_done(self, mem, addr):
         if self._write_finished_cb and mem.id == self.id:
